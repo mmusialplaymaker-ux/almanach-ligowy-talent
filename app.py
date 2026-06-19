@@ -7,6 +7,9 @@ Uruchomienie:
     streamlit run app.py   # pliki: stats_test.csv, matches_test.csv, teamy_kluby_25_26.csv
 """
 import os
+import io
+import re
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -29,7 +32,161 @@ NUMERIC_COMMA = ["match_score", "m_overall_score", "m_season_score", "overall_sc
 NUMERIC_PLAIN = ["minutes", "goals", "yellow_cards", "red_cards", "est_birth_year",
                  "age_at_match", "senior_minutes", "senior_matches_played",
                  "senior_squad_apps", "play_cohort_birth_year", "matches_count"]
-PM_WEIGHTS = {"Jakość": 0.50, "Forma": 0.20, "Dostępność": 0.15, "Konsekwencja": 0.15}
+PM_WEIGHTS = {"Jakość": 0.55, "Forma": 0.10, "Dostępność": 0.20, "Konsekwencja": 0.15}
+
+# ===== PlayMaker Score 2.0 — port produkcyjnego wzoru (ścieżka domyślna, bez pozycji) =====
+# Źródła: DefaultMatchScoreStrategy.ts, ScoreConstants.ts, AgeScoreCalculator.ts,
+# DefaultSegmentFactorCalculator.ts. Dla młodzieży leagueMultiplier bierzemy z rank_p (v7),
+# bo produkcyjnie KAŻDA kategoria (A1/B1/C1...) ma płaski multiplier ~0.08 niezależnie od poziomu.
+PM_SCORE_MODE = _secret("PM_SCORE_MODE", "v7")   # 'v7' (realny score) lub 'prod' (stary match_score)
+
+AGE_IMPACT = 0.35
+AGE_CONST = 0.816496580927726
+OPTIMAL_AGE = 26
+SEGMENT_CONST = 0.947368421052632
+SEGMENT_IMPACT_DEFAULT = 0.8
+STATS_IMPACT = 0.65
+MATCH_IMPACT_DEFAULT = 0.2
+MAX_MATCH_TIME = 90
+LVL_DECAY = 0.82
+_SEG_RATIO = {"wygrana": 1.0, "remis": 0.65, "porażka": 0.4, "porazka": 0.4}
+_RESULT_RATIO = {"wygrana": 1.0, "remis": 0.65, "porażka": 0.4, "porazka": 0.4}
+_SIDE_RATIO = {"gospodarz": 0.74212204820255, "gość": 1.0, "gosc": 1.0}
+_BASE_RATIO = {1: 0.38, 2: 0.31, 3: 0.25, 4: 0.21, 5: 0.20, 6: 0.17,
+               7: 0.15, 8: 0.15, 9: 0.14, 10: 0.13, 11: 0.12, 12: 0.10}
+_EXPECTED_AGE = {1: 19, 2: 19, 3: 19, 4: 18, 5: 17, 6: 17, 7: 16,
+                 8: 15, 9: 15, 10: 14, 11: 13, 12: 12}
+SENIOR_LR = {
+    "337bb869-0b42-484f-8eca-0c8842a13ec9": 1.0,    # Ekstraklasa
+    "50e40483-e8dc-4e4b-9f58-a83f93a54d9a": 0.9,    # 1 liga
+    "5f26d625-e72e-4aa5-9ffe-451025c18e3a": 0.8,    # 2 liga
+    "5cc45e5f-744b-428c-b8af-cdefca38de29": 0.65,   # 3 liga
+    "c164ca31-22e4-43fc-9e30-4f3bcc2b7d72": 0.4,    # 4 liga (generic)
+    "a0583713-115c-4aa5-90f2-140f6eaece15": 0.23,   # 5 liga
+    "c5afdf4b-b449-4ef3-acf5-dded47fc5f58": 0.2,    # klasa okręgowa
+    "63d04023-727a-4c0c-a8c6-4154fe1104b7": 0.12,   # klasa A
+    "b7d2c55b-e2af-44e2-9df2-3f6e05dc1768": 0.1,    # klasa B
+    "895016b3-4fa6-4a68-aa41-5035f9ebef8e": 0.1,    # klasa C
+}
+YOUTH_LID_RANK_L = {
+    "bf74d613-4cc6-4115-ad03-fac139dee351": 1, "8e70e715-3f0f-4481-a01d-51fb7b9aee90": 2,
+    "5b788871-3d38-4073-9500-fcfa4d1b4270": 3, "f19d92f4-14f7-45ab-884f-90da0d03f4a0": 4,
+    "8104ee44-740c-4f6c-8fc3-3bbcf2b3b0e7": 5, "823a45df-052b-4cd5-a060-32ed52921992": 6,
+    "75b51f36-93fd-49cb-86d3-6086dc88081b": 7, "436dc4c6-bc94-4d30-ae92-1113d6d4eee3": 8,
+    "317d1eb3-4873-4749-91b5-edb2d0cd4375": 9, "adf4ca7f-46ef-4aff-a7a0-3e7cc614c59d": 10,
+}
+_RANK_L_NAME = [(r"clj u-?19|junior[óo]w u-?19", 1), (r"makroregional", 2), (r"\ba1\b", 3),
+                (r"\ba2\b", 4), (r"clj u-?17|junior[óo]w u-?17", 5), (r"\bb1\b", 6),
+                (r"\bb2\b", 7), (r"clj u-?15|junior[óo]w u-?15|juniorek", 8), (r"\bc1\b", 9),
+                (r"\bc2\b", 10), (r"\bd1\b", 11), (r"\bd2\b", 12)]
+
+try:
+    with open("play_id_rank_p_v7.json", encoding="utf-8") as _f:
+        RANK_P_DICT = {k: int(v) for k, v in json.load(_f).items()}
+except Exception:
+    RANK_P_DICT = {}
+
+
+def _detect_rank_p(name: str) -> int:
+    """Fallback poziomu rozgrywek po nazwie play (zgodny z junior_league_resolver v7)."""
+    n = name.lower()
+    has_city = bool(re.match(r"^[a-ząćęłńóśźż\s\-\.]+:", name, re.IGNORECASE))
+    if re.search(r"\bclj\b|centralna liga junior", n):
+        return 0
+    if re.search(r"liga makroregionalna", n) and not has_city:
+        return 0
+    if not has_city and re.search(r"\bi liga wojewódzka\b", n):
+        return 2
+    if not has_city and re.search(r"\bii liga wojewódzka\b", n):
+        return 3
+    if not has_city and re.search(r"\biii liga wojewódzka\b|\biv liga wojewódzka\b", n):
+        return 4
+    if re.search(r"\bliga wojewódzka\b", n):
+        return 2
+    if re.search(r"\bi liga okręgowa\b|\bklasa okręgowa\b", n):
+        return 5
+    if re.search(r"\bii liga okręgowa\b", n):
+        return 6
+    if re.search(r"\biii liga okręgowa\b", n):
+        return 7
+    if re.search(r"\biv liga okręgowa\b", n):
+        return 8
+    if re.search(r"\bv liga okręgowa\b|\bvi liga okręgowa\b|\bvii liga okręgowa\b", n):
+        return 9
+    return 10
+
+
+def _rank_l_name(name):
+    n = str(name).lower()
+    for pat, rl in _RANK_L_NAME:
+        if re.search(pat, n):
+            return rl
+    return np.nan
+
+
+def _rank_l_series(df):
+    rl = df["league_id"].astype(str).map(YOUTH_LID_RANK_L) if "league_id" in df.columns else None
+    if rl is None:
+        rl = pd.Series(np.nan, index=df.index)
+    miss = rl.isna()
+    if miss.any():
+        uniq = {u: _rank_l_name(u) for u in df.loc[miss, "league_name"].astype(str).unique()}
+        rl = rl.where(~miss, df.loc[miss, "league_name"].astype(str).map(uniq))
+    return pd.to_numeric(rl, errors="coerce")
+
+
+def _rank_p_series(df):
+    rp = df["play_id"].map(RANK_P_DICT)
+    miss = rp.isna()
+    if miss.any():
+        uniq = {u: _detect_rank_p(u) for u in df.loc[miss, "play_name"].astype(str).unique()}
+        rp = rp.where(~miss, df.loc[miss, "play_name"].astype(str).map(uniq))
+    return pd.to_numeric(rp, errors="coerce")
+
+
+def compute_pm_score(df):
+    """Realny PlayMaker Score 2.0 per mecz (ścieżka domyślna). Zwraca pd.Series w skali 0..1."""
+    idx = df.index
+    rank_l = _rank_l_series(df)
+    rank_p = _rank_p_series(df).fillna(8)
+    is_youth = rank_l.notna()
+    exp_age = rank_l.map(_EXPECTED_AGE)
+
+    age = pd.to_numeric(df.get("age_at_match"), errors="coerce")
+    age = age.fillna(exp_age).fillna(OPTIMAL_AGE)
+
+    # agePart = AGE_IMPACT * AGE_CONST * sqrt(max(0, 1-(age-26)/26)) * ageDiscount(v7)
+    normalized = (1 - (age - OPTIMAL_AGE) / OPTIMAL_AGE).clip(lower=0)
+    age_base = AGE_IMPACT * AGE_CONST * np.sqrt(normalized)
+    dd = (exp_age - age)
+    disc = pd.Series(np.select(
+        [dd >= 8, dd == 7, dd == 6, dd == 5, dd == 4, dd == 3, dd == 2, dd == 1],
+        [1.70, 1.60, 1.50, 1.40, 1.30, 1.20, 1.10, 1.05], default=1.0), index=idx)
+    age_part = age_base * disc
+
+    # leagueMultiplier: młodzież z rank_p (v7), reszta z produkcyjnej mapy seniorskiej
+    youth_lm = rank_l.map(_BASE_RATIO) * (LVL_DECAY ** rank_p)
+    senior_lm = (df["league_id"].astype(str).map(SENIOR_LR).fillna(0.4)
+                 if "league_id" in df.columns else pd.Series(0.4, index=idx))
+    lm = youth_lm.where(is_youth, senior_lm)
+
+    res = df["match_result"].astype(str).str.lower()
+    mn = pd.to_numeric(df["minutes"], errors="coerce").fillna(0)
+    mr = np.where(mn == 0, 0, np.minimum(np.round(mn / 10) * 10, MAX_MATCH_TIME))
+    mr = pd.Series(mr, index=idx)
+    goals = pd.to_numeric(df["goals"], errors="coerce").fillna(0)
+    red = pd.to_numeric(df["red_cards"], errors="coerce").fillna(0)
+    seg_ratio = res.map(_SEG_RATIO).fillna(0.4)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        seg = SEGMENT_CONST * ((goals / mr - red / mr + mr / MAX_MATCH_TIME) * seg_ratio)
+    seg = seg.where(mr > 0, 0.0)
+
+    result_ratio = res.map(_RESULT_RATIO).fillna(0.4)
+    side_ratio = df["team_side"].astype(str).str.lower().map(_SIDE_RATIO).fillna(1.0)
+    match_factor = MATCH_IMPACT_DEFAULT * (result_ratio * side_ratio)
+    stats_part = STATS_IMPACT * ((SEGMENT_IMPACT_DEFAULT * seg + match_factor) * lm)
+    score = (age_part + stats_part).clip(upper=1.0)
+    return pd.DataFrame({"score": score, "stats_part": stats_part}, index=idx)
 # premie kontekstowe doliczane do bazy PM Index (tunable)
 B_UP = 0.05          # gra ze starszymi rocznikiem (junior w gore)
 B_SEN_SQUAD = 0.04   # w kadrze seniorow (0 minut)
@@ -38,12 +195,15 @@ PM_HELP = (
     "**PM Index** to wskaźnik pozycji zawodnika względem stawki tej ligi — im wyżej, tym "
     "lepiej wypada na tle rywali. Baza (zwykle 0–1) to ważona suma czterech percentyli "
     "liczonych w obrębie wybranej ligi:\n\n"
-    "- **Jakość (50%)** — średnia ocena meczu (PM Score) w lidze.\n\n"
-    "- **Forma (20%)** — średnia ocena z 5 ostatnich meczów względem średniej z całego sezonu "
-    "w tej lidze (dodatnia = forma rosnąca, ujemna = spadek).\n\n"
-    "- **Dostępność (15%)** — łączne minuty rozegrane w lidze; jak regularnie zawodnik gra "
+    "- **Jakość (55%)** — część **league + performance** realnego PlayMaker Score 2.0 "
+    "(stats_part: leagueMultiplier × wynik × występ), z leagueMultiplier dla młodzieży z poziomu "
+    "rozgrywek (rank_p, v7). Pełny score (z komponentem wieku) jest w kolumnie „PM Score”, ale dla "
+    "młodzieży dominuje go wiek, więc ranking bierze stats_part, a sygnał wieku/gry w górę jest w premiach.\n\n"
+    "- **Forma (10%)** — średnia z 5 ostatnich meczów (proxy) względem średniej sezonu "
+    "(dodatnia = forma rosnąca, ujemna = spadek).\n\n"
+    "- **Dostępność (20%)** — łączne minuty rozegrane w lidze; jak regularnie zawodnik gra "
     "(zaufanie trenera, zdrowie, rola w zespole).\n\n"
-    "- **Konsekwencja (15%)** — stabilność ocen meczowych (mała zmienność = równy poziom).\n\n"
+    "- **Konsekwencja (15%)** — stabilność ocen meczowych (proxy; mała zmienność = równy poziom).\n\n"
     "Do bazy doliczana jest **premia kontekstowa** (kolumna „Premia”): "
     f"+{B_UP:.2f} za grę ze starszymi rocznikiem, +{B_SEN_SQUAD:.2f} za obecność w kadrze "
     f"seniorów, +{B_SEN_PLAYED:.2f} za realne minuty w seniorach (premie się sumują). "
@@ -56,7 +216,7 @@ CSS = """
 .pmcard{flex:0 0 232px;border:1px solid #2b3340;border-radius:12px;padding:12px 14px;
         background:#191f29;}
 .pmcard h4{margin:0 0 2px;font-size:15px;color:#e8edf4;}
-.pmcard .sub{font-size:12px;color:#9aa7b6;margin-bottom:8px;height:30px;overflow:hidden;}
+.pmcard .sub{font-size:12px;color:#9aa7b6;margin-bottom:8px;line-height:1.4;min-height:30px;}
 .pmcard .pm{font-size:22px;font-weight:700;color:#5db0ff;}
 .pmcard .pmlbl{font-size:10px;color:#8a97a6;letter-spacing:.5px;text-transform:uppercase;}
 .pmcard .row{font-size:12px;color:#c4cdd8;margin-top:6px;}
@@ -65,6 +225,7 @@ CSS = """
 .b.up{background:#2a2150;color:#c4b5fd;}
 .b.sen{background:#16361f;color:#7ee2a0;}
 .b.kad{background:#3a2f14;color:#e6c674;}
+.b.clj{background:#10303a;color:#6fd6e8;}
 /* rozwijana lista filtrow: zawijaj dlugie nazwy zamiast ucinac */
 div[data-baseweb="menu"] li{white-space:normal!important;height:auto!important;line-height:1.35;}
 div[data-baseweb="popover"] ul{max-height:420px;}
@@ -72,14 +233,20 @@ div[data-baseweb="popover"] ul{max-height:420px;}
 """
 
 BADGE_HELP = (
-    "**↑ ze starszymi** — junior grający w starszym roczniku niż dominujący w jego lidze.\n\n"
+    "**↑ ze starszymi** — zawodnik grał powyżej dominującego rocznika danej ligi, w DOWOLNYCH "
+    "rozgrywkach sezonu (np. zawodnik z C1 występujący w A1/B1). Liczba w nawiasie to o ile "
+    "roczników wyżej — maksymalny zaobserwowany skok.\n\n"
     "**🪑 kadra seniorów** — był w meczowej kadrze seniorów, ale rozegrał 0 minut.\n\n"
-    "**⚽ minuty w seniorach** — rozegrał realne minuty w rozgrywkach seniorskich (na karcie z liczbą minut)."
+    "**⚽ minuty w seniorach** — rozegrał realne minuty w rozgrywkach seniorskich (na karcie z liczbą minut).\n\n"
+    "**🏅 minuty w CLJ** — rozegrał minuty w Centralnej Lidze Juniorów (najwyższy poziom juniorski w PL)."
 )
 
 
 # --------------------------------------------------------------------------- #
 def _read_csv(path):
+    # jeśli brak pliku .csv, spróbuj spakowanej wersji .csv.gz (pandas wykryje gzip po rozszerzeniu)
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        path = path + ".gz"
     for enc in ("utf-8", "cp1250", "latin-1"):
         try:
             return pd.read_csv(path, encoding=enc)
@@ -104,6 +271,28 @@ def _coerce(df):
     return df
 
 
+def _pretty_caps(x):
+    """Nazwy spoza słownika teamy_kluby bywają KAPITALIKAMI — ładnie je formatujemy,
+    zachowując krótkie skróty (MKS, GKS, LKS, KS) w wersji wielkimi literami."""
+    if not isinstance(x, str) or any(ch.islower() for ch in x):
+        return x
+    return " ".join(w if (len(w) <= 3 or not any(c.isalpha() for c in w)) else w.capitalize()
+                    for w in x.split())
+
+
+def _logo_src(logo):
+    if isinstance(logo, str) and logo.startswith(("http://", "https://")):
+        return logo
+    try:
+        import base64
+        import mimetypes
+        mt = mimetypes.guess_type(logo)[0] or "image/png"
+        with open(logo, "rb") as fh:
+            return f"data:{mt};base64,{base64.b64encode(fh.read()).decode()}"
+    except Exception:
+        return ""
+
+
 def _clean_names(df, tk):
     tmap = dict(zip(tk["team_id"], tk["final_team_name"]))
     cmap = dict(zip(tk["club_id"], tk["final_club_name"]))
@@ -113,6 +302,9 @@ def _clean_names(df, tk):
         df["club_name"] = df["club_id"].map(cmap).fillna(df.get("club_name"))
     if "opponent_id" in df.columns:
         df["opponent_name"] = df["opponent_id"].map(tmap).fillna(df.get("opponent_name"))
+    for col in ("team_name", "club_name", "opponent_name"):
+        if col in df.columns:
+            df[col] = df[col].map(_pretty_caps)
     return df
 
 
@@ -145,9 +337,25 @@ def _attrs(stats):
     sel = stats[stats["in_selected_play"] == True].copy()
     sel["zawodnik"] = (sel["firstname"].fillna("") + " " + sel["lastname"].fillna("")).str.strip()
     cols = ["player_id", "zawodnik", "team_name", "club_name", "league_name", "play_name",
-            "est_birth_year", "gra_ze_starszymi", "status_seniorski", "senior_minutes",
-            "senior_squad_apps", "roczniki_w_gore"]
-    return sel[[c for c in cols if c in sel.columns]].drop_duplicates("player_id")
+            "region_name", "est_birth_year", "status_seniorski",
+            "senior_minutes", "senior_squad_apps"]
+    base = sel[[c for c in cols if c in sel.columns]].drop_duplicates("player_id")
+    # "Gra ze starszymi" z CAŁEGO sezonu: czy w DOWOLNYCH rozgrywkach zawodnik grał powyżej
+    # dominującego rocznika danej ligi (nie tylko w wybranej). To jest sygnał skautingowy —
+    # np. zawodnik z C1 występujący w A1/B1 ma znacznik na wierszu A1, nie na wierszu C1.
+    up = stats.copy()
+    if "gra_ze_starszymi" in up.columns:
+        up["_gzs"] = (up["gra_ze_starszymi"].astype(str).str.strip().str.lower()
+                      .isin(["true", "1", "t", "yes"]))
+    else:
+        up["_gzs"] = False
+    up["_rwg"] = (pd.to_numeric(up["roczniki_w_gore"], errors="coerce")
+                  if "roczniki_w_gore" in up.columns else np.nan)
+    agg = (up.groupby("player_id")
+           .agg(gra_ze_starszymi=("_gzs", "max"), roczniki_w_gore=("_rwg", "max"))
+           .reset_index())
+    agg["gra_ze_starszymi"] = agg["gra_ze_starszymi"].fillna(False).astype(bool)
+    return base.merge(agg, on="player_id", how="left")
 
 
 def _play_metrics(g):
@@ -183,16 +391,54 @@ def build(_stats, _matches):
     base = play.groupby("player_id").apply(_play_metrics).reset_index()
     tot = _matches.groupby("player_id").apply(_total_metrics).reset_index()
     df = attrs.merge(base, on="player_id", how="left").merge(tot, on="player_id", how="left")
+    # usuń zawodników bez nazwiska (brak w tabeli players → brak danych, nieprzydatni na liście)
+    df = df[df["zawodnik"].fillna("").str.strip() != ""].reset_index(drop=True)
+
+    # --- Realny PlayMaker Score 2.0 per mecz (league-aware przez rank_p dla młodzieży) ---
+    # Wyświetlamy pełny score (age_part + stats_part). Ranking liczymy ze stats_part
+    # (część league + performance), bo dla młodzieży age_part dominuje i zacierałby poziom ligi;
+    # sygnał wieku/gry w górę jest osobno w premiach.
+    mall = _matches.copy()
+    comp = compute_pm_score(mall)
+    mall["_sc"] = comp["score"].values
+    mall["_sp"] = comp["stats_part"].values
+    mall["_rank_p"] = _rank_p_series(mall)
+    mn_all = pd.to_numeric(mall["minutes"], errors="coerce").fillna(0)
+    den_t = mn_all.groupby(mall["player_id"]).sum().replace(0, np.nan)
+    df["pm_score_total"] = df["player_id"].map((mall["_sc"] * mn_all).groupby(mall["player_id"]).sum() / den_t)
+
+    pl = mall[mall["in_selected_play"] == True]
+    mn = mn_all[pl.index]
+    den = mn.groupby(pl["player_id"]).sum().replace(0, np.nan)
+    df["pm_score"] = df["player_id"].map((pl["_sc"] * mn).groupby(pl["player_id"]).sum() / den)
+    df["pm_quality"] = df["player_id"].map((pl["_sp"] * mn).groupby(pl["player_id"]).sum() / den)
+    df["rank_p_avg"] = df["player_id"].map((pl["_rank_p"] * mn).groupby(pl["player_id"]).sum() / den).round(1)
+
+    # Forma/Konsekwencja ze stats_part per mecz (gęste, league-aware)
+    def _form(gp):
+        x = gp.sort_values("match_date")["_sp"].dropna()
+        m = x.mean()
+        return pd.Series({"_forma_px": ((x.tail(5).mean() - m) / m) if len(x) >= 3 and m else np.nan,
+                          "_kons_px": (1 / (1 + x.std(ddof=0))) if len(x) >= 2 else np.nan})
+    pform = pl.groupby("player_id").apply(_form)
+    df["_forma_px"] = df["player_id"].map(pform["_forma_px"])
+    df["_kons_px"] = df["player_id"].map(pform["_kons_px"])
+
     df["Ofensywa"] = df["gole_per90"].rank(pct=True)
-    df["Jakość"] = df["score_play"].rank(pct=True)
-    df["Forma"] = df["forma"].rank(pct=True)
-    df["Konsekwencja"] = df["konsekwencja"].rank(pct=True)
+    if PM_SCORE_MODE == "v7":
+        df["Jakość"] = df["pm_quality"].rank(pct=True)
+        df["Forma"] = df["_forma_px"].rank(pct=True)
+        df["Konsekwencja"] = df["_kons_px"].rank(pct=True)
+    else:
+        df["Jakość"] = df["score_play"].rank(pct=True)
+        df["Forma"] = df["forma"].rank(pct=True)
+        df["Konsekwencja"] = df["konsekwencja"].rank(pct=True)
     df["Dostępność"] = df["min_play"].rank(pct=True)
     df["Dyscyplina"] = (-df["kartki_per90"]).rank(pct=True)
     df["PM_base"] = sum(df[a].fillna(0) * w for a, w in PM_WEIGHTS.items())
     sm = df["senior_minutes"].fillna(0)
     sq = df["senior_squad_apps"].fillna(0)
-    df["PM_premia"] = ((df["gra_ze_starszymi"] == True).astype(float) * B_UP
+    df["PM_premia"] = (df["gra_ze_starszymi"].fillna(False).astype(bool).astype(float) * B_UP
                        + (sm > 0).astype(float) * B_SEN_PLAYED
                        + ((sm == 0) & (sq > 0)).astype(float) * B_SEN_SQUAD)
     df["PM_Index"] = df["PM_base"] + df["PM_premia"]
@@ -200,6 +446,11 @@ def build(_stats, _matches):
     pp = _matches.groupby("player_id")["play_name"].agg(lambda s: set(s.dropna()))
     df["_leagues"] = df["player_id"].map(lg)
     df["_plays"] = df["player_id"].map(pp)
+    clj = _matches[_matches["league_name"].astype(str)
+                   .str.contains(r"\bCLJ\b|Centralna Liga Junior", case=False,
+                                 regex=True, na=False)]
+    cljm = clj.groupby("player_id")["minutes"].sum()
+    df["clj_minutes"] = df["player_id"].map(cljm).fillna(0)
     ry = _matches["match_date"].dt.year.max()
     df["_ref_year"] = int(ry) if pd.notna(ry) else 2026
     return df
@@ -207,14 +458,64 @@ def build(_stats, _matches):
 
 def badges_html(r):
     out = []
-    if r.get("gra_ze_starszymi") is True:
-        out.append('<span class="b up">↑ ze starszymi</span>')
+    if bool(r.get("gra_ze_starszymi")):
+        n = r.get("roczniki_w_gore")
+        lbl = f"↑ ze starszymi (+{int(n)})" if pd.notna(n) and n and n >= 1 else "↑ ze starszymi"
+        out.append(f'<span class="b up">{lbl}</span>')
     sm = r.get("senior_minutes") or 0
     if sm > 0:
         out.append(f'<span class="b sen">⚽ {int(sm)}′ w seniorach</span>')
     elif (r.get("senior_squad_apps") or 0) > 0:
         out.append('<span class="b kad">🪑 kadra seniorów</span>')
+    cm = r.get("clj_minutes") or 0
+    if cm > 0:
+        out.append(f'<span class="b clj">🏅 {int(cm)}′ w CLJ</span>')
     return "".join(out)
+
+
+EXPORT_COLS = [("zawodnik", "Zawodnik"), ("club_name", "Klub"), ("team_name", "Drużyna"),
+               ("region_name", "Województwo"), ("est_birth_year", "Rocznik"),
+               ("liga_wiodaca", "Liga wiodąca"),
+               ("PM_Index", "PM Index"), ("PM_premia", "Premia"),
+               ("pm_score", "Score (liga)"), ("pm_score_total", "Score (total)"),
+               ("rank_p_avg", "Poziom"),
+               ("min_play", "Min (liga)"),
+               ("mecze_play", "Mecze (liga)"), ("gole_play", "Gole (liga)"),
+               ("min_total", "Min (total)"), ("mecze_total", "Mecze (total)"),
+               ("senior_minutes", "Min seniorzy"), ("clj_minutes", "Min CLJ"),
+               ("gra_ze_starszymi", "Ze starszymi"),
+               ("status_seniorski", "Status senior")]
+
+
+def export_frame(f, top_n):
+    cols = [(s, d) for s, d in EXPORT_COLS if s in f.columns]
+    df = f.head(int(top_n))[[s for s, _ in cols]].rename(columns=dict(cols)).copy()
+    for c in ["PM Index", "Premia", "Score (liga)"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round(3)
+    df.insert(0, "Lp.", range(1, len(df) + 1))
+    return df
+
+
+def build_excel(df, title):
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="Zestawienie", startrow=2)
+        ws = xw.sheets["Zestawienie"]
+        ws["A1"] = title
+        ws["A1"].font = Font(bold=True, size=13)
+        for ci in range(1, df.shape[1] + 1):
+            cell = ws.cell(row=3, column=ci)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="2E5AAC")
+            cell.alignment = Alignment(horizontal="center")
+        ws.freeze_panes = "A4"
+        for i, col in enumerate(df.columns, start=1):
+            ml = max([len(str(col))] + [len(str(v)) for v in df[col].head(300)])
+            ws.column_dimensions[get_column_letter(i)].width = min(max(ml + 2, 8), 38)
+    return buf.getvalue()
 
 
 def cards_html(top):
@@ -266,46 +567,96 @@ def main():
     data = build(stats, matches)
 
     sel_mask = stats["in_selected_play"] == True
-    liga = stats.loc[sel_mask, "play_name"].dropna().iloc[0] if sel_mask.any() else "—"
-    region = ""
-    if "region_name" in stats.columns:
-        rr = stats.loc[sel_mask, "region_name"].dropna()
-        region = rr.iloc[0] if len(rr) else ""
-    region = region or REGION
-    st.title("Almanach ligowy")
-    reg = f"Region: **{region}**  ·  " if region else ""
-    st.markdown(f"{reg}**{liga}** · zawodników: {len(data)} · "
-                f"z minutami w seniorach: {(data['senior_minutes'].fillna(0) > 0).sum()}")
-    st.caption("Wszyscy zawodnicy z wybranej ligi wraz z meczami w bieżącym sezonie "
-               "we wszystkich rozgrywkach. Kolumny „(liga)” dotyczą wybranej ligi, "
-               "„(total)” — całego sezonu.")
+    sel = stats[sel_mask]
+    plays = sorted(sel["play_name"].dropna().unique())
+    leagues = sorted(sel["league_name"].dropna().unique()) if "league_name" in sel.columns else []
+    regions = sorted(r for r in (sel["region_name"].dropna().unique()
+                                 if "region_name" in stats.columns else []) if r)
+    if len(plays) <= 1:
+        liga = plays[0] if plays else "—"
+    elif len(leagues) == 1:
+        liga = f"{leagues[0]} — {len(plays)} rozgrywek"
+    else:
+        liga = f"{len(plays)} rozgrywek ({', '.join(leagues[:4])}{'…' if len(leagues) > 4 else ''})"
+    region_txt = ", ".join(regions) or REGION
+    logo = _secret("CLUB_LOGO_URL", "")
+    if not logo:
+        for _p in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp"):
+            if os.path.exists(_p):
+                logo = _p
+                break
+
+    def _header_text():
+        st.title("Almanach ligowy")
+        reg = f"Region: **{region_txt}**  ·  " if region_txt else ""
+        st.markdown(f"{reg}**{liga}** · zawodników: {len(data)} · "
+                    f"z minutami w seniorach: {(data['senior_minutes'].fillna(0) > 0).sum()}")
+        if len(plays) > 1:
+            st.caption(f"Zestawienie obejmuje {len(plays)} rozgrywek (cały wybrany poziom / region). "
+                       "Kolumny „(liga)” = łącznie z całego wybranego zakresu, „(total)” = cały sezon "
+                       "zawodnika we wszystkich rozgrywkach.")
+        else:
+            st.caption("Wszyscy zawodnicy z wybranej ligi wraz z meczami w bieżącym sezonie we "
+                       "wszystkich rozgrywkach. Kolumny „(liga)” dotyczą wybranej ligi, „(total)” — "
+                       "całego sezonu.")
+
+    src = _logo_src(logo) if logo else ""
+    if src:
+        hc = st.columns([6, 1])
+        with hc[0]:
+            _header_text()
+        hc[1].markdown(
+            '<div style="display:flex;justify-content:flex-end;align-items:flex-start;">'
+            f'<img src="{src}" style="width:auto;max-width:100%;max-height:104px;'
+            'object-fit:contain;">'
+            "</div>", unsafe_allow_html=True)
+    else:
+        _header_text()
 
     # ---- FILTRY ----
+    FILTER_KEYS = ["f_zaw", "f_klub", "f_rozgr", "f_liga", "f_woj",
+                   "f_score", "f_min", "f_mecz", "f_kart", "f_up", "f_kad", "f_sen", "f_clj"]
     with st.container(border=True):
+        ch = st.columns([6, 1])
+        ch[0].markdown("**Filtry**")
+        if ch[1].button("Wyczyść filtry", use_container_width=True):
+            for _k in FILTER_KEYS:
+                st.session_state.pop(_k, None)
+            st.rerun()
+        has_region = "region_name" in data.columns and data["region_name"].notna().any()
+        if has_region:
+            rr = st.columns([2, 6])
+            f_reg = rr[0].multiselect("Województwo",
+                                      sorted(data["region_name"].dropna().unique()), key="f_woj")
+        else:
+            f_reg = []
         r1 = st.columns([2, 2, 2])
-        q = r1[0].text_input("Zawodnik (imię/nazwisko)", "")
-        f_club = r1[1].multiselect("Klub", sorted(data["club_name"].dropna().unique()))
+        q = r1[0].text_input("Zawodnik (imię/nazwisko)", "", key="f_zaw")
+        f_club = r1[1].multiselect("Klub", sorted(data["club_name"].dropna().unique()), key="f_klub")
         f_lg = r1[2].multiselect("Rozgrywki (gdziekolwiek grał)",
-                                 sorted({x for s in data["_leagues"].dropna() for x in s}))
+                                 sorted({x for s in data["_leagues"].dropna() for x in s}), key="f_rozgr")
         f_pl = st.multiselect("Liga (gdziekolwiek grał)",
-                              sorted({x for s in data["_plays"].dropna() for x in s}))
+                              sorted({x for s in data["_plays"].dropna() for x in s}), key="f_liga")
         r2 = st.columns(4)
-        def rng(col, label, c):
+        def rng(col, label, c, key):
             lo, hi = float(np.nanmin(data[col])), float(np.nanmax(data[col]))
             if not np.isfinite(lo) or lo == hi:
                 return (lo, hi)
-            return c.slider(label, lo, hi, (lo, hi))
-        s_score = rng("score_play", "Score (liga)", r2[0])
-        s_min = rng("min_play", "Minuty (liga)", r2[1])
-        s_mecz = rng("mecze_play", "Mecze (liga)", r2[2])
-        s_kart = rng("kartki_total", "Kartki total", r2[3])
-        r3 = st.columns(3)
-        f_up = r3[0].checkbox("↑ Grający ze starszymi")
-        f_kad = r3[1].checkbox("🪑 W kadrze seniorów")
-        f_sen = r3[2].checkbox("⚽ Minuty w seniorach")
+            return c.slider(label, lo, hi, (lo, hi), key=key)
+        s_score = rng("pm_score", "Score (liga)", r2[0], "f_score")
+        s_min = rng("min_play", "Minuty (liga)", r2[1], "f_min")
+        s_mecz = rng("mecze_play", "Mecze (liga)", r2[2], "f_mecz")
+        s_kart = rng("kartki_total", "Kartki total", r2[3], "f_kart")
+        r3 = st.columns(4)
+        f_up = r3[0].checkbox("↑ Grający ze starszymi", key="f_up")
+        f_kad = r3[1].checkbox("🪑 W kadrze seniorów", key="f_kad")
+        f_sen = r3[2].checkbox("⚽ Minuty w seniorach", key="f_sen")
+        f_clj = r3[3].checkbox("🏅 Minuty w CLJ", key="f_clj")
 
     # ---- FILTROWANIE ----
     f = data.copy()
+    if f_reg:
+        f = f[f["region_name"].isin(f_reg)]
     if q:
         f = f[f["zawodnik"].str.contains(q, case=False, na=False)]
     if f_club:
@@ -314,15 +665,17 @@ def main():
         f = f[f["_leagues"].apply(lambda s: bool(s & set(f_lg)) if isinstance(s, set) else False)]
     if f_pl:
         f = f[f["_plays"].apply(lambda s: bool(s & set(f_pl)) if isinstance(s, set) else False)]
-    for col, (lo, hi) in [("score_play", s_score), ("min_play", s_min),
+    for col, (lo, hi) in [("pm_score", s_score), ("min_play", s_min),
                           ("mecze_play", s_mecz), ("kartki_total", s_kart)]:
         f = f[f[col].fillna(-1).between(lo, hi) | f[col].isna()]
     if f_up:
-        f = f[f["gra_ze_starszymi"] == True]
+        f = f[f["gra_ze_starszymi"].fillna(False).astype(bool)]
     if f_kad:
         f = f[(f["senior_squad_apps"].fillna(0) > 0) & (f["senior_minutes"].fillna(0) == 0)]
     if f_sen:
         f = f[f["senior_minutes"].fillna(0) > 0]
+    if f_clj:
+        f = f[f["clj_minutes"].fillna(0) > 0]
     f = f.sort_values("PM_Index", ascending=False).reset_index(drop=True)
 
     # ---- KARTY TOPOWYCH (scroll w bok) ----
@@ -334,40 +687,58 @@ def main():
 
     # ---- TABELA ----
     st.markdown("### 📋 Analityka")
-    ci = st.columns([2, 2, 6])
+    ci = st.columns([2, 2, 2, 3])
     with ci[0].popover("ℹ️ Czym jest PM Index?"):
         st.markdown(PM_HELP)
     with ci[1].popover("🏷️ Znaczniki"):
         st.markdown(BADGE_HELP)
+    max_n = max(10, len(f))
+    top_n = ci[2].number_input("Top N do Excela", min_value=10, max_value=max_n,
+                               value=min(100, max_n), step=10)
+    xlsx = build_excel(export_frame(f, top_n),
+                       f"Almanach ligowy — {liga}" + (f" — {region_txt}" if region_txt else ""))
+    ci[3].download_button("⬇️ Pobierz zestawienie (Excel)", xlsx,
+                          file_name="zestawienie_playmaker.xlsx",
+                          mime=("application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"),
+                          use_container_width=True)
 
     def znaczniki(r):
         z = []
-        if r.get("gra_ze_starszymi") is True: z.append("↑")
+        if bool(r.get("gra_ze_starszymi")): z.append("↑")
         if (r.get("senior_minutes") or 0) > 0: z.append("⚽")
         elif (r.get("senior_squad_apps") or 0) > 0: z.append("🪑")
+        if (r.get("clj_minutes") or 0) > 0: z.append("🏅")
         return " ".join(z)
     ft = f.copy()
     ft["Znaczniki"] = ft.apply(znaczniki, axis=1)
-    cmap = {"zawodnik": "Zawodnik", "Znaczniki": "Znaczniki", "team_name": "Drużyna",
+    cmap = {"zawodnik": "Zawodnik", "Znaczniki": "Znaczniki", "region_name": "Województwo",
+            "team_name": "Drużyna",
             "club_name": "Klub", "est_birth_year": "Rocznik", "PM_Index": "PM Index",
-            "PM_premia": "Premia",
-            "score_play": "Score (liga)", "score_total": "Score (total)",
+            "PM_premia": "Premia", "pm_score": "Score (liga)", "pm_score_total": "Score (total)",
+            "rank_p_avg": "Poziom",
             "min_play": "Min (liga)", "min_total": "Min (total)",
             "mecze_play": "Mecze (liga)", "mecze_total": "Mecze (total)",
             "gole_play": "Gole (liga)", "gole_total": "Gole (total)",
-            "kartki_total": "Kartki", "senior_minutes": "Min. seniory"}
+            "kartki_total": "Kartki", "senior_minutes": "Min. seniorzy",
+            "clj_minutes": "Min. CLJ"}
     disp = ft[[c for c in cmap if c in ft.columns]].rename(columns=cmap)
     event = st.dataframe(
         disp, use_container_width=True, height=430, hide_index=True,
         on_select="rerun", selection_mode="single-row",
         column_config={
             "PM Index": st.column_config.NumberColumn(format="%.2f", help=PM_HELP),
+            "Score (liga)": st.column_config.NumberColumn(format="%.3f",
+                help="Realny PlayMaker Score 2.0 (v7) — średnia ważona minutami z meczów w wybranym "
+                     "zakresie. Dla młodzieży leagueMultiplier z poziomu rozgrywek (rank_p)."),
+            "Score (total)": st.column_config.NumberColumn(format="%.3f",
+                help="Realny PlayMaker Score 2.0 (v7) — średnia ważona minutami ze wszystkich meczów sezonu."),
+            "Poziom": st.column_config.NumberColumn(format="%.1f",
+                help="Średni rank_p rozgrywek (0 = topowe juniorskie / CLJ, 10 = słabe lokalne). Niżej = mocniej."),
             "Premia": st.column_config.NumberColumn(format="%.2f",
                 help="Premia kontekstowa doliczona do PM Index (gra ze starszymi / kadra / minuty w seniorach)."),
-            "Score (liga)": st.column_config.NumberColumn(format="%.3f"),
-            "Score (total)": st.column_config.NumberColumn(format="%.3f"),
             "Znaczniki": st.column_config.TextColumn(
-                help="↑ gra ze starszymi · 🪑 w kadrze seniorów · ⚽ minuty w seniorach")})
+                help="↑ gra ze starszymi · 🪑 w kadrze seniorów · ⚽ minuty w seniorach · 🏅 minuty w CLJ")})
 
     sel_pid = f.iloc[event.selection.rows[0]]["player_id"] if event.selection.rows else None
 
@@ -379,15 +750,17 @@ def main():
     else:
         st.markdown(f"### ⚽ Mecze ({len(f)} zawodników) — kliknij gracza wyżej, by zawęzić")
         mm = matches[matches["player_id"].isin(f["player_id"])]
-    mc = {"match_date": "Data", "league_name": "Liga", "play_name": "Play",
+    mm = mm.assign(pm_score=compute_pm_score(mm)["score"].values)
+    mc = {"match_date": "Data", "region_name": "Województwo", "league_name": "Liga",
+          "play_name": "Play",
           "team_name": "Drużyna", "opponent_name": "Przeciwnik", "team_side": "Strona",
           "match_result": "Wynik", "minutes": "Min", "goals": "Gole",
-          "yellow_cards": "ŻK", "red_cards": "CK", "match_score": "Ocena",
+          "yellow_cards": "ŻK", "red_cards": "CK", "pm_score": "Ocena (v7)",
           "status_seniorski": "Status senior"}
     mshow = (mm.sort_values("match_date", ascending=False)
                [[c for c in mc if c in mm.columns]].rename(columns=mc))
     st.dataframe(mshow, use_container_width=True, height=360, hide_index=True,
-                 column_config={"Ocena": st.column_config.NumberColumn(format="%.3f")})
+                 column_config={"Ocena (v7)": st.column_config.NumberColumn(format="%.3f")})
 
 
 if __name__ == "__main__":
